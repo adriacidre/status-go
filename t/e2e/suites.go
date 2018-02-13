@@ -16,7 +16,7 @@ import (
 // NodeManagerTestSuite defines a test suit with NodeManager.
 type NodeManagerTestSuite struct {
 	suite.Suite
-	NodeManager *node.NodeManager
+	NodeManager node.Manager
 }
 
 func init() {

@@ -1,226 +1,326 @@
 package node
 
 import (
-	"encoding/json"
+	"context"
 	"errors"
 	"fmt"
 	"os"
-	"path"
 	"path/filepath"
-	"strings"
+	"time"
 
-	"github.com/ethereum/go-ethereum/core"
-	"github.com/ethereum/go-ethereum/crypto"
-	"github.com/ethereum/go-ethereum/eth"
+	ethereum "github.com/ethereum/go-ethereum"
+	"github.com/ethereum/go-ethereum/accounts"
+	"github.com/ethereum/go-ethereum/accounts/keystore"
 	"github.com/ethereum/go-ethereum/eth/downloader"
 	"github.com/ethereum/go-ethereum/les"
 	"github.com/ethereum/go-ethereum/node"
-	"github.com/ethereum/go-ethereum/p2p"
 	"github.com/ethereum/go-ethereum/p2p/discover"
-	"github.com/ethereum/go-ethereum/p2p/nat"
-	"github.com/ethereum/go-ethereum/whisper/mailserver"
-	"github.com/ethereum/go-ethereum/whisper/notifications"
 	whisper "github.com/ethereum/go-ethereum/whisper/whisperv5"
-	"github.com/status-im/status-go/geth/log"
+	"github.com/labstack/gommon/log"
 	"github.com/status-im/status-go/geth/params"
-	shhmetrics "github.com/status-im/status-go/metrics/whisper"
+	"github.com/status-im/status-go/geth/rpc"
 )
 
-// node-related errors
-var (
-	ErrEthServiceRegistrationFailure     = errors.New("failed to register the Ethereum service")
-	ErrWhisperServiceRegistrationFailure = errors.New("failed to register the Whisper service")
-	ErrLightEthRegistrationFailure       = errors.New("failed to register the LES service")
-	ErrNodeMakeFailure                   = errors.New("error creating p2p node")
-	ErrNodeRunFailure                    = errors.New("error running p2p node")
-	ErrNodeStartFailure                  = errors.New("error starting p2p node")
-)
+// tickerResolution is the delta to check blockchain sync progress.
+const tickerResolution = time.Second
 
-// MakeNode create a geth node entity
-func MakeNode(config *params.NodeConfig) (*node.Node, error) {
-	// make sure data directory exists
-	if err := os.MkdirAll(filepath.Join(config.DataDir), os.ModePerm); err != nil {
+// RPCClientError reported when rpc client is initialized.
+type RPCClientError error
+
+// EthNodeError is reported when node crashed on start up.
+type EthNodeError error
+
+type statusNode struct {
+	node           *node.Node         // reference to Geth P2P stack/node
+	config         *params.NodeConfig // Status node configuration
+	whisperService *whisper.Whisper   // reference to Whisper service
+	lesService     *les.LightEthereum // reference to LES service
+	rpcClient      *rpc.Client        // reference to RPC client
+}
+
+// newStatusNode returns an initilaized and started new statusNode and the
+// associated error in case something is broken.
+func newStatusNode(config *params.NodeConfig, fn node.ServiceConstructor) (*statusNode, error) {
+	snode := statusNode{}
+
+	if err := snode.init(config, fn); err != nil {
+		return nil, err
+	}
+	if err := snode.start(); err != nil {
 		return nil, err
 	}
 
-	// make sure keys directory exists
-	if err := os.MkdirAll(filepath.Join(config.KeyStoreDir), os.ModePerm); err != nil {
-		return nil, err
-	}
+	return &snode, nil
+}
 
-	// configure required node (should you need to update node's config, e.g. add bootstrap nodes, see node.Config)
-	stackConfig := defaultEmbeddedNodeConfig(config)
-
-	if len(config.NodeKeyFile) > 0 {
-		log.Info("Loading private key file", "file", config.NodeKeyFile)
-		pk, err := crypto.LoadECDSA(config.NodeKeyFile)
-		if err != nil {
-			log.Warn(fmt.Sprintf("Failed loading private key file '%s': %v", config.NodeKeyFile, err))
-		}
-
-		// override node's private key
-		stackConfig.P2P.PrivateKey = pk
-	}
-
-	stack, err := node.New(stackConfig)
+// init initializes a statusNode based on the given config and mailServer and
+// returns an error if needed
+func (s *statusNode) init(config *params.NodeConfig, mailServer node.ServiceConstructor) error {
+	ethNode, err := MakeNode(config)
 	if err != nil {
-		return nil, ErrNodeMakeFailure
+		return err
 	}
 
-	// Start Ethereum service if we are not expected to use an upstream server.
-	if !config.UpstreamConfig.Enabled {
-		if err := activateEthService(stack, config); err != nil {
-			return nil, fmt.Errorf("%v: %v", ErrEthServiceRegistrationFailure, err)
-		}
-	}
+	s.node = ethNode
+	s.config = config
 
-	// start Whisper service
-	if err := activateShhService(stack, config); err != nil {
-		return nil, fmt.Errorf("%v: %v", ErrWhisperServiceRegistrationFailure, err)
-	}
-
-	return stack, nil
-}
-
-// defaultEmbeddedNodeConfig returns default stack configuration for mobile client node
-func defaultEmbeddedNodeConfig(config *params.NodeConfig) *node.Config {
-	nc := &node.Config{
-		DataDir:           config.DataDir,
-		KeyStoreDir:       config.KeyStoreDir,
-		UseLightweightKDF: true,
-		NoUSB:             true,
-		Name:              config.Name,
-		Version:           config.Version,
-		P2P: p2p.Config{
-			NoDiscovery:      !config.Discovery,
-			DiscoveryV5:      true,
-			DiscoveryV5Addr:  ":0",
-			BootstrapNodes:   nil,
-			BootstrapNodesV5: nil,
-			ListenAddr:       config.ListenAddr,
-			NAT:              nat.Any(),
-			MaxPeers:         config.MaxPeers,
-			MaxPendingPeers:  config.MaxPendingPeers,
-		},
-		IPCPath:     makeIPCPath(config),
-		HTTPCors:    []string{"*"},
-		HTTPModules: strings.Split(config.APIModules, ","),
-		WSHost:      makeWSHost(config),
-		WSPort:      config.WSPort,
-		WSOrigins:   []string{"*"},
-		WSModules:   strings.Split(config.APIModules, ","),
-	}
-
-	if config.RPCEnabled {
-		nc.HTTPHost = config.HTTPHost
-		nc.HTTPPort = config.HTTPPort
-	}
-
-	if config.BootClusterConfig.Enabled {
-		nc.P2P.BootstrapNodes = makeBootstrapNodes(config.BootClusterConfig.BootNodes)
-	}
-
-	return nc
-}
-
-// activateEthService configures and registers the eth.Ethereum service with a given node.
-func activateEthService(stack *node.Node, config *params.NodeConfig) error {
-	if !config.LightEthConfig.Enabled {
-		log.Info("LES protocol is disabled")
-		return nil
-	}
-
-	var genesis *core.Genesis
-	if config.LightEthConfig.Genesis != "" {
-		genesis = new(core.Genesis)
-		if err := json.Unmarshal([]byte(config.LightEthConfig.Genesis), genesis); err != nil {
-			return fmt.Errorf("invalid genesis spec: %v", err)
-		}
-	}
-
-	ethConf := eth.DefaultConfig
-	ethConf.Genesis = genesis
-	ethConf.SyncMode = downloader.LightSync
-	ethConf.NetworkId = config.NetworkID
-	ethConf.DatabaseCache = config.LightEthConfig.DatabaseCache
-
-	if err := stack.Register(func(ctx *node.ServiceContext) (node.Service, error) {
-		return les.New(ctx, &ethConf)
-	}); err != nil {
-		return fmt.Errorf("%v: %v", ErrLightEthRegistrationFailure, err)
+	// activate MailService required for Offline Inboxing
+	if err := ethNode.Register(mailServer); err != nil {
+		return err
 	}
 
 	return nil
 }
 
-// activateShhService configures Whisper and adds it to the given node.
-func activateShhService(stack *node.Node, config *params.NodeConfig) error {
-	if !config.WhisperConfig.Enabled {
-		log.Info("SHH protocol is disabled")
+// start starts the underlying node
+func (s *statusNode) start() error {
+	// start underlying node
+	if err := s.node.Start(); err != nil {
+		return EthNodeError(err)
+	}
+	// init RPC client for this node
+	localRPCClient, err := s.node.Attach()
+	if err == nil {
+		s.rpcClient, err = rpc.NewClient(localRPCClient, s.config.UpstreamConfig)
+	}
+	if err != nil {
+		log.Error("Failed to create an RPC client", "error", err)
+		return RPCClientError(err)
+	}
+	// populate static peers exits when node stopped
+	go func() {
+		if err := s.populateStaticPeers(); err != nil {
+			log.Error("Static peers population", "error", err)
+		}
+	}()
+
+	return nil
+}
+
+// stop resets the current statusNode to its initial status
+func (s *statusNode) stop() error {
+	if err := s.node.Stop(); err != nil {
+		return err
+	}
+	s.node = nil
+	s.config = nil
+	s.lesService = nil
+	s.whisperService = nil
+	s.rpcClient = nil
+
+	return nil
+}
+
+// populateStaticPeers connects current node with status publicly available
+// LES/SHH/Swarm cluster defined on the config
+func (s *statusNode) populateStaticPeers() error {
+	if !s.config.BootClusterConfig.Enabled {
+		log.Info("Boot cluster is disabled")
 		return nil
 	}
 
-	serviceConstructor := func(*node.ServiceContext) (node.Service, error) {
-		whisperConfig := config.WhisperConfig
-		whisperService := whisper.New(nil)
-
-		// enable metrics
-		whisperService.RegisterEnvelopeTracer(&shhmetrics.EnvelopeTracer{})
-
-		// enable mail service
-		if whisperConfig.EnableMailServer {
-			if whisperConfig.Password == "" {
-				if err := whisperConfig.ReadPasswordFile(); err != nil {
-					return nil, err
-				}
-			}
-
-			log.Info("Register MailServer")
-
-			var mailServer mailserver.WMailServer
-			whisperService.RegisterServer(&mailServer)
-			mailServer.Init(whisperService, whisperConfig.DataDir, whisperConfig.Password, whisperConfig.MinimumPoW)
+	for _, enode := range s.config.BootClusterConfig.BootNodes {
+		err := s.addPeer(enode)
+		if err != nil {
+			log.Warn("Boot node addition failed", "error", err)
+			continue
 		}
+		log.Info("Boot node added", "enode", enode)
+	}
 
-		// enable notification service
-		if whisperConfig.EnablePushNotification {
-			log.Info("Register PushNotification server")
+	return nil
+}
 
-			var notificationServer notifications.NotificationServer
-			whisperService.RegisterNotificationServer(&notificationServer)
-			notificationServer.Init(whisperService, whisperConfig)
+// addPeer adds new static peer to the underlying node
+func (s *statusNode) addPeer(url string) error {
+	// Try to add the url as a static peer and return
+	parsedNode, err := discover.ParseNode(url)
+	if err != nil {
+		return err
+	}
+	s.node.Server().AddPeer(parsedNode)
+	return nil
+}
+
+// peerCount gets the count of the node attached peers
+func (s *statusNode) peerCount() int {
+	return s.node.Server().PeerCount()
+}
+
+// isAvailable check if we have a node running and make sure is fully started
+func (s *statusNode) isAvailable() bool {
+	if s.node == nil || s.node.Server() == nil {
+		return false
+	}
+	return true
+}
+
+// getNode returns the unrerlying node
+func (s *statusNode) getNode() *node.Node {
+	return s.node
+}
+
+// getLightEthereumService returns the LES service or error if there is any
+// problem accessing it
+func (s *statusNode) getLightEthereumService() (*les.LightEthereum, error) {
+	if s.lesService == nil {
+		if err := s.node.Service(&s.lesService); err != nil {
+			log.Warn("Cannot obtain LES service", "error", err)
+			return nil, ErrInvalidLightEthereumService
 		}
-
-		return whisperService, nil
 	}
-
-	return stack.Register(serviceConstructor)
+	if s.lesService == nil {
+		return nil, ErrInvalidLightEthereumService
+	}
+	return s.lesService, nil
 }
 
-// makeIPCPath returns IPC-RPC filename
-func makeIPCPath(config *params.NodeConfig) string {
-	if !config.IPCEnabled {
-		return ""
+// getWhisperService returns the whisper service or error if there is any
+// problem accessing it
+func (s *statusNode) getWhisperService() (*whisper.Whisper, error) {
+	if s.whisperService == nil {
+		if err := s.node.Service(&s.whisperService); err != nil {
+			log.Warn("Cannot obtain whisper service", "error", err)
+			return nil, ErrInvalidWhisperService
+		}
 	}
-
-	return path.Join(config.DataDir, config.IPCFile)
+	if s.whisperService == nil {
+		return nil, ErrInvalidWhisperService
+	}
+	return s.whisperService, nil
 }
 
-// makeWSHost returns WS-RPC Server host, given enabled/disabled flag
-func makeWSHost(config *params.NodeConfig) string {
-	if !config.WSEnabled {
-		return ""
+// getAccountManager exposes reference to node's accounts manager
+func (s *statusNode) getAccountManager() (*accounts.Manager, error) {
+	accountManager := s.node.AccountManager()
+	if accountManager == nil {
+		return nil, ErrInvalidAccountManager
 	}
-
-	return config.WSHost
+	return accountManager, nil
 }
 
-// makeBootstrapNodes returns default (hence bootstrap) list of peers
-func makeBootstrapNodes(enodes []string) []*discover.Node {
-	var bootstrapNodes []*discover.Node
-	for _, enode := range enodes {
-		bootstrapNodes = append(bootstrapNodes, discover.MustParseNode(enode))
+// getAccountKeyStore exposes reference to accounts key store
+func (s *statusNode) getAccountKeyStore() (*keystore.KeyStore, error) {
+	accountManager, err := s.getAccountManager()
+	if err != nil {
+		return nil, err
 	}
 
-	return bootstrapNodes
+	backends := accountManager.Backends(keystore.KeyStoreType)
+	if len(backends) == 0 {
+		return nil, ErrAccountKeyStoreMissing
+	}
+
+	keyStore, ok := backends[0].(*keystore.KeyStore)
+	if !ok {
+		return nil, ErrAccountKeyStoreMissing
+	}
+
+	return keyStore, nil
+}
+
+// getRPCClient exposes reference to RPC client connected to the running node.
+func (s *statusNode) getRPCClient() *rpc.Client {
+	return s.rpcClient
+}
+
+// getConfig returns the current statusNode configuration
+func (s *statusNode) getConfig() *params.NodeConfig {
+	return s.config
+}
+
+// resetChainData removes chain data if node is not running.
+func (s *statusNode) resetChainData() error {
+	config := s.getConfig()
+	chainDataDir := filepath.Join(config.DataDir, config.Name, "lightchaindata")
+	if _, err := os.Stat(chainDataDir); os.IsNotExist(err) {
+		// is it really an error, if we want to remove it as next step?
+		return err
+	}
+	err := os.RemoveAll(chainDataDir)
+	if err == nil {
+		log.Info("Chain data has been removed", "dir", chainDataDir)
+	}
+
+	return err
+}
+
+// getLESDownloader gets the related LES downloader or an error
+func (s *statusNode) getLESDownloader() (*downloader.Downloader, error) {
+	les, err := s.getLightEthereumService()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get LES service: %v", err)
+	}
+
+	downloader := les.Downloader()
+	if downloader == nil {
+		return nil, errors.New("LightEthereumService downloader is nil")
+	}
+
+	return downloader, nil
+}
+
+// isSyncCompleted returns true in case the blockchain synchronization process
+// is complete
+func (s *statusNode) isSyncCompleted(progress ethereum.SyncProgress) bool {
+	return s.peerCount() > 0 && progress.CurrentBlock >= progress.HighestBlock
+}
+
+// isLocalPrivateChain check if the configured network id is the same as the
+// default test network (private chain)
+func (s *statusNode) isLocalPrivateChain() bool {
+	return s.config.NetworkID == params.StatusChainNetworkID
+}
+
+// ensureSync waits until blockchain synchronization is complete.
+func (s *statusNode) ensureSync(ctx context.Context) error {
+	downloader, err := s.getLESDownloader()
+	if err != nil {
+		return err
+	}
+
+	progress := downloader.Progress()
+	if s.isSyncCompleted(progress) {
+		log.Debug("Synchronization completed", "current block", progress.CurrentBlock, "highest block", progress.HighestBlock)
+		return nil
+	}
+
+	ticker := time.NewTicker(tickerResolution)
+	defer ticker.Stop()
+
+	progressTicker := time.NewTicker(time.Minute)
+	defer progressTicker.Stop()
+
+	for {
+		if done, err := s.tickManager(ctx, downloader, ticker, progressTicker); done {
+			return err
+		}
+	}
+}
+
+func (s *statusNode) tickManager(ctx context.Context, downloader *downloader.Downloader, ticker, progressTicker *time.Ticker) (bool, error) {
+	select {
+	case <-ctx.Done():
+		return true, errors.New("timeout during node synchronization")
+	case <-ticker.C:
+		if s.peerCount() == 0 {
+			log.Debug("No established connections with any peers, continue waiting for a sync")
+			return false, nil
+		}
+		if downloader.Synchronising() {
+			log.Debug("Synchronization is in progress")
+			return false, nil
+		}
+		progress := downloader.Progress()
+		if progress.CurrentBlock >= progress.HighestBlock {
+			log.Info("Synchronization completed", "current block", progress.CurrentBlock, "highest block", progress.HighestBlock)
+			return true, nil
+		}
+		log.Debug("Synchronization is not finished", "current", progress.CurrentBlock, "highest", progress.HighestBlock)
+	case <-progressTicker.C:
+		progress := downloader.Progress()
+		log.Warn("Synchronization is not finished", "current", progress.CurrentBlock, "highest", progress.HighestBlock)
+	}
+
+	return false, nil
 }
