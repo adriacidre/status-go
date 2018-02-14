@@ -25,7 +25,7 @@ const (
 // StatusBackend implements Status.im service
 type StatusBackend struct {
 	mu              sync.Mutex
-	nodeManager     *node.NodeManager
+	nodeManager     node.Manager
 	accountManager  common.AccountManager
 	txQueueManager  *transactions.Manager
 	jailManager     common.JailManager
@@ -36,7 +36,7 @@ type StatusBackend struct {
 func NewStatusBackend() *StatusBackend {
 	defer log.Info("Status backend initialized")
 
-	nodeManager := node.NewNodeManager()
+	nodeManager := node.NewManager()
 	accountManager := account.NewManager(nodeManager)
 	txQueueManager := transactions.NewManager(nodeManager, accountManager)
 	jailManager := jail.New(nodeManager)

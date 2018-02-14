@@ -22,7 +22,7 @@ type WhisperTestSuite struct {
 }
 
 func (s *WhisperTestSuite) SetupTest() {
-	s.NodeManager = node.NewNodeManager()
+	s.NodeManager = node.NewManager()
 	s.NotNil(s.NodeManager)
 }
 
